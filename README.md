@@ -22,9 +22,8 @@ This is a small **prototype security system** for user registration and login, b
   - ML-inspired bot risk scoring (tiny neural net over interaction telemetry; prototype)
   - Step-up verification on login (CAPTCHA + PoW)
 
-User data is stored locally in `data/users.toml` (prototype database).
+User data is stored locally in `data/users.db` (SQLite user database).
 Audit events are written to `data/audit.db`.
-Honeyword indices are stored in `data/honey.toml`.
 
 ## Pages
 
@@ -54,7 +53,7 @@ MFA is required by default: after **register**, you are sent to `/mfa/setup`. Af
 
 ## Common password list
 
-`src/Security.jl` loads `src/data/most-common-passwords.txt` (≈100k entries) and penalizes those passwords heavily.
+`src/Security.jl` loads `src/passwords/most-common-passwords.txt` (≈100k entries) and penalizes those passwords heavily.
 
 ## Requirements (Python-style)
 
@@ -68,3 +67,4 @@ See `requirements-julia.txt` (for familiarity only). Julia installs from `Projec
 - `src/Storage.jl` – TOML persistence and password history policy
 - `server.jl` – web entry point
 - `src/WebServer.jl` – HTTP.jl web server routes and web security controls
+- `src/SecureRegApp.jl` – package entrypoint

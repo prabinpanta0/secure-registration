@@ -1,0 +1,7 @@
+# Julia does not use requirements.txt for installs.
+# Canonical dependencies are in `Project.toml` (+ `Manifest.toml` if you choose to commit it).
+#
+# This file is provided for assignment familiarity only.
+
+HTTP
+# Optional (nice-to-have): DataStructures (CircularBuffer). This prototype has a built-in fallback.

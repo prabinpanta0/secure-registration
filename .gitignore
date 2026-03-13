@@ -1,0 +1,5 @@
+.julia/
+data/*
+!data/.gitkeep
+*.tmp
+.env
