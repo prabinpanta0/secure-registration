@@ -3,10 +3,12 @@ using Test
 include(joinpath(@__DIR__, "..", "src", "Security.jl"))
 include(joinpath(@__DIR__, "..", "src", "Storage.jl"))
 include(joinpath(@__DIR__, "..", "src", "MLDefense.jl"))
+include(joinpath(@__DIR__, "..", "src", "WebServer.jl"))
 
 using .Security
 using .Storage
 using .MLDefense
+using .SecureRegWeb
 
 @testset "Security primitives" begin
     rep = Security.password_strength("CorrectHorseBatteryStaple!2026", "alice")
@@ -41,6 +43,33 @@ end
         @test Storage.verify_login_status(db, "alice", "TestPass!1234", pepper) == :ok
         @test Storage.verify_login_status(db, "alice", honey[mod1(idx + 1, length(honey))], pepper) == :honey
     end
+end
+
+@testset "MFA verify token + routing helpers" begin
+    ENV["APP_SERVER_SECRET"] = "unit-test-secret"
+
+    tok = SecureRegWeb._mfa_verify_token("alice"; issued_at_s=Int(floor(time())))
+    parsed = SecureRegWeb._mfa_verify_token_parse(tok)
+    @test parsed !== nothing
+    u, _ = parsed
+    @test u == "alice"
+
+    old_tok = SecureRegWeb._mfa_verify_token("alice"; issued_at_s=Int(floor(time())) - (SecureRegWeb.MFA_VERIFY_TOKEN_TTL_SECONDS + 1))
+    @test SecureRegWeb._mfa_verify_token_parse(old_tok) === nothing
+
+    @test SecureRegWeb._target_path("/mfa/verify?tok=abc") == "/mfa/verify"
+    q = SecureRegWeb._parse_query("/mfa/verify?tok=abc&x=1")
+    @test q["tok"] == "abc"
+    @test q["x"] == "1"
+
+    nav_anon = SecureRegWeb._nav_html(nothing)
+    @test occursin("href=\"/login\"", nav_anon)
+    @test occursin("href=\"/register\"", nav_anon)
+    @test !occursin("href=\"/account\"", nav_anon)
+
+    nav_auth = SecureRegWeb._nav_html(Dict{String,Any}("user" => "alice"))
+    @test occursin("href=\"/account\"", nav_auth)
+    @test !occursin("href=\"/login\"", nav_auth)
 end
 
 @testset "ML defense" begin

@@ -12,7 +12,30 @@ end
 
 import Pkg
 Pkg.activate(@__DIR__)
-Pkg.instantiate(; update_registry=false)
+
+function ensure_project_ready!()
+    try
+        Pkg.instantiate(; update_registry=false)
+        return
+    catch e
+        msg = sprint(showerror, e)
+        println("\nPkg.instantiate failed: ", msg)
+        println("Attempting `Pkg.resolve()` + `Pkg.instantiate()` (may require network on first run)...\n")
+        try
+            Pkg.resolve()
+            Pkg.instantiate()
+            return
+        catch e2
+            msg2 = sprint(showerror, e2)
+            println("\nFailed to prepare environment: ", msg2)
+            println("\nIf this is a fresh repo/depot, run once:")
+            println("  export JULIA_DEPOT_PATH=\"$(@__DIR__)/.julia\" && julia --project=. -e 'using Pkg; Pkg.resolve(); Pkg.instantiate()'")
+            rethrow(e2)
+        end
+    end
+end
+
+ensure_project_ready!()
 
 include("src/DevTools.jl")
 include("src/WebServer.jl")
@@ -22,9 +45,9 @@ using .SecureRegWeb
 using Random
 using Base64
 
-function _rand_token(nbytes::Int)::String
+function _rand_token_hex(nbytes::Int)::String
     rd = RandomDevice()
-    return base64encode(rand(rd, UInt8, nbytes))
+    return bytes2hex(rand(rd, UInt8, nbytes))
 end
 
 function _dotenv_parse_line(line::AbstractString)
@@ -83,7 +106,7 @@ function ensure_env_secrets!()
     changed = false
     for key in ("APP_SERVER_SECRET", "APP_PEPPER", "APP_PW_TAG_KEY")
         if !haskey(parsed, key) || isempty(parsed[key])
-            parsed[key] = _rand_token(32)
+            parsed[key] = _rand_token_hex(32)
             ENV[key] = parsed[key]
             changed = true
         end
@@ -111,9 +134,9 @@ ENV["APP_REQUIRE_MFA"] = get(ENV, "APP_REQUIRE_MFA", "1")
 ENV["APP_LOG_REQUESTS"] = get(ENV, "APP_LOG_REQUESTS", "1")
 ENV["APP_AUDIT_STDOUT"] = get(ENV, "APP_AUDIT_STDOUT", "1")
 
-if get(ENV, "APP_SEED", "1") in ("1", "true", "TRUE", "yes", "YES")
-    DevTools.seed_demo_user!()
-end
+# if get(ENV, "APP_SEED", "1") in ("1", "true", "TRUE", "yes", "YES")
+#     DevTools.seed_demo_user!()
+# end
 
 println("Starting SecureRegWeb for browser testing...")
 println("- URL: http://$(get(ENV, "APP_HOST", "127.0.0.1")):$(get(ENV, "APP_PORT", "8080"))")
@@ -121,42 +144,35 @@ println("- Logs: stdout + SQLite audit in `data/audit.db`")
 println("- Stop: Ctrl+C (or type `q` + Enter)\n")
 
 Base.exit_on_sigint(false)
-
 server = SecureRegWeb.start()
 
-stopper = @async begin
+function _shutdown!(server; reason::AbstractString)
+    println("\nShutting down ($(reason)).")
     try
-        while !eof(stdin)
-            line = readline(stdin)
-            s = lowercase(strip(line))
-            if s in ("q", "quit", "exit")
-                println("\nShutting down (q).")
-                try
-                    close(server)
-                catch
-                end
-                return
-            end
-        end
+        close(server)
     catch
     end
+    try
+        wait(server)
+    catch
+    end
+    println("Stopped.")
 end
 
 try
-    wait(server)
+    while true
+        eof(stdin) && break
+        line = readline(stdin)
+        s = lowercase(strip(line))
+        if s in ("q", "quit", "exit")
+            _shutdown!(server; reason="q")
+            break
+        end
+    end
 catch e
     if e isa InterruptException
-        println("\nShutting down (Ctrl+C).")
-        try
-            close(server)
-        catch
-        end
+        _shutdown!(server; reason="Ctrl+C")
     else
         rethrow()
-    end
-finally
-    try
-        Base.throwto(stopper, InterruptException())
-    catch
     end
 end

@@ -41,6 +41,9 @@ const DB_PATH = joinpath(@__DIR__, "..", "data", "users.db")
 const HOST = get(ENV, "APP_HOST", "127.0.0.1")
 const PORT = parse(Int, get(ENV, "APP_PORT", "8080"))
 const SESSION_TTL_SECONDS = 60 * 60
+const SESSION_ABSOLUTE_TTL_SECONDS = parse(Int, get(ENV, "APP_SESSION_ABS_TTL_SECONDS", string(8 * 60 * 60)))
+const SESSION_GC_INTERVAL_SECONDS = parse(Int, get(ENV, "APP_SESSION_GC_INTERVAL_SECONDS", "30"))
+const MAX_SESSIONS = parse(Int, get(ENV, "APP_MAX_SESSIONS", "20000"))
 const APP_ENV = lowercase(get(ENV, "APP_ENV", "dev"))
 const COOKIE_SECURE = begin
     v = get(ENV, "APP_COOKIE_SECURE", "")
@@ -63,6 +66,11 @@ const RATE_REFILL_REGISTER = 0.08
 const USERNAME_RE = r"^[A-Za-z0-9_]{3,16}$"
 const PASSWORD_EXPIRE_DAYS = 90
 const RESERVED_USERNAMES = Set(["admin", "administrator", "root", "support", "security", "mod", "moderator", "__canary__", "canary", "deathnote"])
+
+const MAX_FORM_BYTES = parse(Int, get(ENV, "APP_MAX_FORM_BYTES", "16384"))
+const MAX_PASSWORD_BYTES = parse(Int, get(ENV, "APP_MAX_PASSWORD_BYTES", "256"))
+const MFA_SETUP_TOKEN_TTL_SECONDS = parse(Int, get(ENV, "APP_MFA_SETUP_TOKEN_TTL_SECONDS", "900"))
+const MFA_VERIFY_TOKEN_TTL_SECONDS = parse(Int, get(ENV, "APP_MFA_VERIFY_TOKEN_TTL_SECONDS", "300"))
 
 const _IP_GUARD = Dict{String, Dict{String, Any}}()  # ip => {count, first_ts, banned_until}
 
@@ -167,11 +175,49 @@ function _read_body_bytes(body)::Vector{UInt8}
     end
 end
 
-function _parse_form(body)::Dict{String,String}
-    s = String(_read_body_bytes(body))
+struct FormTooLargeError <: Exception
+    max_bytes::Int
+    got_bytes::Int
+end
+
+function Base.showerror(io::IO, e::FormTooLargeError)
+    print(io, "form too large (got ", e.got_bytes, " bytes, max ", e.max_bytes, ")")
+end
+
+function _parse_form(body; max_bytes::Int=MAX_FORM_BYTES)::Dict{String,String}
+    bytes = _read_body_bytes(body)
+    length(bytes) <= max_bytes || throw(FormTooLargeError(max_bytes, length(bytes)))
+    s = try
+        String(bytes)
+    catch
+        throw(ArgumentError("invalid form encoding"))
+    end
     out = Dict{String,String}()
     isempty(s) && return out
     for part in split(s, "&")
+        isempty(part) && continue
+        kv = split(part, "=", limit=2)
+        k = _url_decode(kv[1])
+        v = length(kv) == 2 ? _url_decode(kv[2]) : ""
+        out[k] = v
+    end
+    return out
+end
+
+function _target_path(target::AbstractString)::String
+    s = String(target)
+    parts = split(s, "?", limit=2)
+    return parts[1]
+end
+
+function _parse_query(target::AbstractString)::Dict{String,String}
+    s = String(target)
+    parts = split(s, "?", limit=2)
+    length(parts) == 2 || return Dict{String,String}()
+    q = parts[2]
+    out = Dict{String,String}()
+    isempty(q) && return out
+    for part in split(q, "&")
         isempty(part) && continue
         kv = split(part, "=", limit=2)
         k = _url_decode(kv[1])
@@ -217,31 +263,75 @@ function _cookie_set(name::AbstractString, value::AbstractString; path::Abstract
 end
 
 const _SESSIONS = Dict{String, Dict{String,Any}}()
+const _SESSIONS_LAST_GC = Ref{Float64}(0.0)
 
 function _now_utc_s()::String
     return Dates.format(Dates.now(Dates.UTC), dateformat"yyyy-mm-ddTHH:MM:SSZ")
 end
 
 function _session_new()::Tuple{String,Dict{String,Any}}
+    _sessions_gc!()
     sid = _b64rand(24)
-    sess = Dict{String,Any}("expires_at" => time() + SESSION_TTL_SECONDS)
+    nowt = time()
+    sess = Dict{String,Any}(
+        "expires_at" => nowt + SESSION_TTL_SECONDS,
+        "created_at" => nowt,
+    )
     _SESSIONS[sid] = sess
     return sid, sess
 end
 
+function _sessions_gc!(; force::Bool=false)
+    nowt = time()
+    if !force
+        (nowt - _SESSIONS_LAST_GC[]) < SESSION_GC_INTERVAL_SECONDS && return
+    end
+    _SESSIONS_LAST_GC[] = nowt
+
+    # Remove expired sessions (idle + absolute lifetime).
+    for sid in collect(keys(_SESSIONS))
+        sess = _SESSIONS[sid]
+        exp = Float64(get(sess, "expires_at", 0.0))
+        created = Float64(get(sess, "created_at", 0.0))
+        if nowt > exp || (created > 0.0 && (nowt - created) > SESSION_ABSOLUTE_TTL_SECONDS)
+            delete!(_SESSIONS, sid)
+        end
+    end
+
+    # Hard cap to limit memory DoS (after cleaning).
+    while length(_SESSIONS) > MAX_SESSIONS
+        delete!(_SESSIONS, first(keys(_SESSIONS)))
+    end
+
+    return nothing
+end
+
 function _session_get(req::HTTP.Request)::Tuple{String,Dict{String,Any},Bool}
+    _sessions_gc!()
     sid = _cookie_get(req, "sid")
     if sid !== nothing && haskey(_SESSIONS, sid)
         sess = _SESSIONS[sid]
         exp = Float64(get(sess, "expires_at", 0.0))
-        if time() <= exp
-            sess["expires_at"] = time() + SESSION_TTL_SECONDS
+        created = Float64(get(sess, "created_at", 0.0))
+        nowt = time()
+        if nowt <= exp && (created <= 0.0 || (nowt - created) <= SESSION_ABSOLUTE_TTL_SECONDS)
+            sess["expires_at"] = nowt + SESSION_TTL_SECONDS
             return sid, sess, false
         else
             delete!(_SESSIONS, sid)
         end
     end
     return _session_new()..., true
+end
+
+function _session_regenerate!(sid::String, sess::Dict{String,Any}; keep::Vector{String}=String[])::Tuple{String,Dict{String,Any}}
+    new_sid, new_sess = _session_new()
+    for k in keep
+        haskey(sess, k) || continue
+        new_sess[k] = sess[k]
+    end
+    delete!(_SESSIONS, sid)
+    return new_sid, new_sess
 end
 
 function _csrf_token!(sess::Dict{String,Any})::String
@@ -270,6 +360,133 @@ function _b64url_bytes(bytes::Vector{UInt8})::String
     s = replace(s, "/" => "_")
     s = replace(s, "=" => "")
     return s
+end
+
+function _b64url_decode_bytes(s::AbstractString)::Vector{UInt8}
+    t = replace(String(s), "-" => "+")
+    t = replace(t, "_" => "/")
+    rem4 = mod(length(t), 4)
+    if rem4 != 0
+        t *= repeat("=", 4 - rem4)
+    end
+    return base64decode(t)
+end
+
+function _consttime_eq(a::Vector{UInt8}, b::Vector{UInt8})::Bool
+    length(a) == length(b) || return false
+    acc::UInt8 = 0x00
+    @inbounds for i in eachindex(a)
+        acc |= a[i] ⊻ b[i]
+    end
+    return acc == 0x00
+end
+
+function _sign_b64url(payload_bytes::Vector{UInt8})::String
+    mac = SHA.hmac_sha256(collect(codeunits(_server_secret())), payload_bytes)
+    return _b64url_bytes(mac)
+end
+
+function _mfa_setup_token(username::AbstractString, secret::AbstractString; issued_at_s::Int=Int(floor(time())))
+    # Signed token so MFA setup can succeed even if cookies are blocked/lost (dev UX),
+    # without storing secrets server-side beyond the rendered page.
+    #
+    # Format: base64url(payload) "." base64url(hmac_sha256(server_secret, payload))
+    #
+    # payload: "u=<username>&s=<secret>&iat=<unix>&n=<nonce>"
+    nonce = _b64rand(12)
+    payload = "u=" * String(username) * "&s=" * String(secret) * "&iat=" * string(issued_at_s) * "&n=" * nonce
+    payload_bytes = Vector{UInt8}(codeunits(payload))
+    sig = _sign_b64url(payload_bytes)
+    return _b64url_bytes(payload_bytes) * "." * sig
+end
+
+function _mfa_setup_token_parse(tok::AbstractString)
+    parts = split(String(tok), ".", limit=2)
+    length(parts) == 2 || return nothing
+    payload_bytes = try
+        _b64url_decode_bytes(parts[1])
+    catch
+        return nothing
+    end
+    sig = String(parts[2])
+    expected = _sign_b64url(payload_bytes)
+    _consttime_eq(Vector{UInt8}(codeunits(sig)), Vector{UInt8}(codeunits(expected))) || return nothing
+    payload = String(payload_bytes)
+    kv = Dict{String,String}()
+    for p in split(payload, "&")
+        isempty(p) && continue
+        kvr = split(p, "=", limit=2)
+        length(kvr) == 2 || continue
+        kv[kvr[1]] = kvr[2]
+    end
+    haskey(kv, "u") && haskey(kv, "s") && haskey(kv, "iat") || return nothing
+    iat = try
+        parse(Int, kv["iat"])
+    catch
+        return nothing
+    end
+    (Int(floor(time())) - iat) <= MFA_SETUP_TOKEN_TTL_SECONDS || return nothing
+    return (kv["u"], kv["s"], iat)
+end
+
+function _mfa_verify_token(username::AbstractString; issued_at_s::Int=Int(floor(time())))
+    # Signed token so /mfa/verify can recover if session cookies are lost between redirects (dev UX).
+    #
+    # Format: base64url(payload) "." base64url(hmac_sha256(server_secret, payload))
+    #
+    # payload: "u=<username>&iat=<unix>&n=<nonce>"
+    nonce = _b64rand(12)
+    payload = "u=" * String(username) * "&iat=" * string(issued_at_s) * "&n=" * nonce
+    payload_bytes = Vector{UInt8}(codeunits(payload))
+    sig = _sign_b64url(payload_bytes)
+    return _b64url_bytes(payload_bytes) * "." * sig
+end
+
+function _mfa_verify_token_parse(tok::AbstractString)
+    parts = split(String(tok), ".", limit=2)
+    length(parts) == 2 || return nothing
+    payload_bytes = try
+        _b64url_decode_bytes(parts[1])
+    catch
+        return nothing
+    end
+    sig = String(parts[2])
+    expected = _sign_b64url(payload_bytes)
+    _consttime_eq(Vector{UInt8}(codeunits(sig)), Vector{UInt8}(codeunits(expected))) || return nothing
+    payload = String(payload_bytes)
+    kv = Dict{String,String}()
+    for p in split(payload, "&")
+        isempty(p) && continue
+        kvr = split(p, "=", limit=2)
+        length(kvr) == 2 || continue
+        kv[kvr[1]] = kvr[2]
+    end
+    haskey(kv, "u") && haskey(kv, "iat") || return nothing
+    iat = try
+        parse(Int, kv["iat"])
+    catch
+        return nothing
+    end
+    (Int(floor(time())) - iat) <= MFA_VERIFY_TOKEN_TTL_SECONDS || return nothing
+    return (kv["u"], iat)
+end
+
+function _flash_set!(sess::Dict{String,Any}, kind::AbstractString, msg::AbstractString)
+    sess["flash_kind"] = String(kind)
+    sess["flash_msg"] = String(msg)
+    return nothing
+end
+
+function _flash_take_html!(sess::Dict{String,Any})::String
+    kind = get(sess, "flash_kind", "")
+    msg = get(sess, "flash_msg", "")
+    if !(kind isa String) || !(msg isa String) || isempty(kind) || isempty(msg)
+        return ""
+    end
+    delete!(sess, "flash_kind")
+    delete!(sess, "flash_msg")
+    cls = kind == "ok" ? "ok" : (kind == "error" ? "error" : "muted")
+    return "<div class='card' style='margin-bottom:12px;'><p class='$cls' style='margin:0;'>" * _html_escape(msg) * "</p></div>"
 end
 
 function _ip_token(req::HTTP.Request)::String
@@ -311,8 +528,30 @@ function _security_headers(nonce::Union{Nothing,String}=nothing)::Vector{Pair{St
     return headers
 end
 
-function _html_page(title::AbstractString, body_html::AbstractString)
+function _nav_html(sess::Union{Nothing,Dict{String,Any}}=nothing)::String
+    u = nothing
+    if sess !== nothing
+        v = get(sess, "user", nothing)
+        if v isa String && !isempty(v)
+            u = v
+        end
+    end
+    if u === nothing
+        return """
+          <a class="pill" href="/">Home</a>
+          <a class="pill" href="/register">Register</a>
+          <a class="pill" href="/login">Login</a>
+        """
+    end
+    return """
+          <a class="pill" href="/">Home</a>
+          <a class="pill" href="/account">Account</a>
+        """
+end
+
+function _html_page(title::AbstractString, body_html::AbstractString; sess::Union{Nothing,Dict{String,Any}}=nothing)
     tip = COOKIE_SECURE ? "" : """<p class="muted" style="margin:14px 6px 0 6px;">Tip: set <code>APP_COOKIE_SECURE=1</code> <i>only when you run behind HTTPS</i> so cookies get the <code>Secure</code> flag and HSTS is enabled.</p>"""
+    nav = _nav_html(sess)
     return """
     <!doctype html>
     <html lang="en">
@@ -429,10 +668,7 @@ function _html_page(title::AbstractString, body_html::AbstractString)
       <div class="top">
         <div class="logo"><div class="dot"></div><div><b>SecureReg</b> <span class="muted">prototype</span></div></div>
         <div class="nav">
-          <a class="pill" href="/">Home</a>
-          <a class="pill" href="/register">Register</a>
-          <a class="pill" href="/login">Login</a>
-          <a class="pill" href="/account">Account</a>
+          $nav
         </div>
       </div>
       <div class="main">
@@ -475,6 +711,11 @@ function _auth_user(sess::Dict{String,Any})::Union{Nothing,String}
 end
 
 function _password_feedback_html(pw::AbstractString, username::AbstractString)
+    if ncodeunits(pw) > MAX_PASSWORD_BYTES
+        rep = Security.PasswordReport(0, "Too long", 0.0, ["Password exceeds the maximum length ($(MAX_PASSWORD_BYTES) bytes)."])
+        tips = join(["<li>" * _html_escape(t) * "</li>" for t in rep.feedback], "")
+        return rep, "<div class='card'><div><b>Password strength:</b> $(_html_escape(rep.label))</div><ul>$tips</ul></div>"
+    end
     rep = Security.password_strength(String(pw), String(username))
     tips = join(["<li>" * _html_escape(t) * "</li>" for t in rep.feedback], "")
     return rep, "<div class='card'><div><b>Password strength:</b> $(_html_escape(rep.label)) (score $(rep.score)/100)</div><ul>$tips</ul></div>"
@@ -482,6 +723,9 @@ end
 
 function _register_get(req::HTTP.Request)
     sid, sess, isnew = _session_get(req)
+    if _auth_user(sess) !== nothing
+        return _redirect("/account"; headers=["Set-Cookie" => _cookie_set("sid", sid)])
+    end
     csrf = _csrf_token!(sess)
     sess["reg_issued_at_ms"] = time() * 1000.0
 
@@ -743,7 +987,7 @@ function _register_get(req::HTTP.Request)
     if isnew
         push!(headers, "Set-Cookie" => _cookie_set("sid", sid))
     end
-    return _respond(req, 200, _html_page("Register", body); headers=headers)
+    return _respond(req, 200, _html_page("Register", body; sess=sess); headers=headers)
 end
 
 function _register_post(req::HTTP.Request)
@@ -751,36 +995,54 @@ function _register_post(req::HTTP.Request)
     db = Storage.load_db(DB_PATH)
     ip = _ip(req)
 
+    if _auth_user(sess) !== nothing
+        return _redirect("/account"; headers=["Set-Cookie" => _cookie_set("sid", sid)])
+    end
+
     if _ip_is_banned(ip)
         Audit.log_event("ip_temp_ban"; detail=ip)
-        return _respond(req, 429, _html_page("Slow down", "<h1>Too many attempts</h1><p class='error'>Try again in a few minutes.</p>"))
+        return _respond(req, 429, _html_page("Slow down", "<h1>Too many attempts</h1><p class='error'>Try again in a few minutes.</p>"; sess=sess))
     end
 
     if _is_suspicious_ua(_ua(req))
         Audit.log_event("register_blocked_ua"; detail=_ua(req))
-        return _respond(req, 403, _html_page("Blocked", "<h1>Blocked</h1><p class='error'>Suspicious client.</p>"))
+        return _respond(req, 403, _html_page("Blocked", "<h1>Blocked</h1><p class='error'>Suspicious client.</p>"; sess=sess))
     end
 
     if !Storage.allow_action!(db, "register:" * _ip(req); capacity=RATE_CAPACITY_REGISTER, refill_per_sec=RATE_REFILL_REGISTER)
         Storage.save_db(db)
         Audit.log_event("register_rate_limited")
         _ip_fail!(ip)
-        return _respond(req, 429, _html_page("Slow down", "<h1>Too many attempts</h1><p class='error'>Please wait and try again.</p>"))
+        return _respond(req, 429, _html_page("Slow down", "<h1>Too many attempts</h1><p class='error'>Please wait and try again.</p>"; sess=sess))
     end
 
-    form = _parse_form(req.body)
+    form = try
+        _parse_form(req.body)
+    catch e
+        headers = Pair{String,String}[]
+        isnew && push!(headers, "Set-Cookie" => _cookie_set("sid", sid))
+        if e isa FormTooLargeError
+            Audit.log_event("register_form_too_large"; detail=sprint(showerror, e))
+            _ip_fail!(ip)
+            return _respond(req, 413, _html_page("Too large", "<h1>Request too large</h1><p class='error'>Form too large.</p><p><a href='/register'>Back</a></p>"; sess=sess); headers=headers)
+        else
+            Audit.log_event("register_form_invalid"; detail=sprint(showerror, e))
+            _ip_fail!(ip)
+            return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>Invalid form.</p><p><a href='/register'>Back</a></p>"; sess=sess); headers=headers)
+        end
+    end
     if !_require_csrf(form, sess)
         Audit.log_event("register_csrf_failed")
-        return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>CSRF validation failed.</p>"))
+        return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>CSRF validation failed.</p>"; sess=sess))
     end
 
     if !isempty(get(form, "website", ""))
         Audit.log_event("register_honeypot_tripped")
-        return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>Invalid form.</p>"))
+        return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>Invalid form.</p>"; sess=sess))
     end
     if !isempty(get(form, "company", ""))
         Audit.log_event("register_honeypot_tripped")
-        return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>Invalid form.</p>"))
+        return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>Invalid form.</p>"; sess=sess))
     end
 
     username = strip(get(form, "username", ""))
@@ -814,6 +1076,9 @@ function _register_post(req::HTTP.Request)
     if occursin(r"[\r\n\0]", password)
         push!(errors, "Password contains invalid control characters.")
     end
+    if ncodeunits(password) > MAX_PASSWORD_BYTES
+        push!(errors, "Password is too long (max $(MAX_PASSWORD_BYTES) bytes).")
+    end
 
     expected_a = get(sess, "captcha_a", nothing)
     got_a = try parse(Int, captcha) catch; nothing end
@@ -846,7 +1111,7 @@ function _register_post(req::HTTP.Request)
         if isnew
             push!(headers, "Set-Cookie" => _cookie_set("sid", sid))
         end
-        return _respond(req, 400, _html_page("Register failed", body); headers=headers)
+        return _respond(req, 400, _html_page("Register failed", body; sess=sess); headers=headers)
     end
 
     if risk.score >= 0.92
@@ -854,7 +1119,7 @@ function _register_post(req::HTTP.Request)
         Audit.log_event("register_blocked_risk"; username=username, detail="risk=$(round(risk.score; digits=3)) reasons=" * join(risk.reasons, ","))
         _ip_fail!(ip)
         body = "<h1>Extra verification required</h1><p class='error'>This request looked automated. Please retry more slowly from a normal browser.</p><p><a href='/register'>Back</a></p>"
-        return _respond(req, 403, _html_page("Verification", body); headers=["Set-Cookie" => _cookie_set("sid", sid)])
+        return _respond(req, 403, _html_page("Verification", body; sess=sess); headers=["Set-Cookie" => _cookie_set("sid", sid)])
     end
 
     honeywords, honey_index = Security.generate_honeywords(password, username; count=7)
@@ -866,11 +1131,12 @@ function _register_post(req::HTTP.Request)
     Storage.save_db(db)
     Audit.log_event("register_success"; username=username)
     _ip_success!(ip)
+    sid, sess = _session_regenerate!(sid, sess)
     sess["user"] = username
     headers = Pair{String,String}["Set-Cookie" => _cookie_set("sid", sid)]
     if REQUIRE_MFA
         body = _mfa_setup_body_html!(sess, username) * "<p class='muted' style='margin-top:12px;'>After enabling MFA, you’ll land on the dashboard.</p>"
-        return _respond(req, 200, _html_page("TOTP Setup", body); headers=headers)
+        return _respond(req, 200, _html_page("TOTP Setup", body; sess=sess); headers=headers)
     else
         return _redirect("/account"; headers=headers)
     end
@@ -878,6 +1144,9 @@ end
 
 function _login_get(req::HTTP.Request)
     sid, sess, isnew = _session_get(req)
+    if _auth_user(sess) !== nothing
+        return _redirect("/account"; headers=["Set-Cookie" => _cookie_set("sid", sid)])
+    end
     csrf = _csrf_token!(sess)
     sess["login_issued_at_ms"] = time() * 1000.0
 
@@ -1023,7 +1292,7 @@ function _login_get(req::HTTP.Request)
     if isnew
         push!(headers, "Set-Cookie" => _cookie_set("sid", sid))
     end
-    return _respond(req, 200, _html_page("Login", body); headers=headers)
+    return _respond(req, 200, _html_page("Login", body; sess=sess); headers=headers)
 end
 
 function _login_post(req::HTTP.Request)
@@ -1036,7 +1305,23 @@ function _login_post(req::HTTP.Request)
         return _respond(req, 429, _html_page("Slow down", "<h1>Too many attempts</h1><p class='error'>Try again in a few minutes.</p>"))
     end
 
-    form = _parse_form(req.body)
+    form = try
+        _parse_form(req.body)
+    catch e
+        headers = Pair{String,String}[]
+        isnew && push!(headers, "Set-Cookie" => _cookie_set("sid", sid))
+        if e isa FormTooLargeError
+            Storage.save_db(db)
+            Audit.log_event("login_form_too_large"; detail=sprint(showerror, e))
+            _ip_fail!(ip)
+            return _respond(req, 413, _html_page("Too large", "<h1>Request too large</h1><p class='error'>Form too large.</p><p><a href='/login'>Back</a></p>"); headers=headers)
+        else
+            Storage.save_db(db)
+            Audit.log_event("login_form_invalid"; detail=sprint(showerror, e))
+            _ip_fail!(ip)
+            return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>Invalid form.</p><p><a href='/login'>Back</a></p>"); headers=headers)
+        end
+    end
     if !_require_csrf(form, sess)
         return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>CSRF validation failed.</p>"))
     end
@@ -1052,6 +1337,13 @@ function _login_post(req::HTTP.Request)
     telemetry = MLDefense.parse_telemetry(get(form, "telemetry", ""))
     captcha = strip(get(form, "captcha", ""))
     pow_nonce_s = strip(get(form, "pow_nonce", ""))
+
+    if ncodeunits(password) > MAX_PASSWORD_BYTES
+        Storage.save_db(db)
+        Audit.log_event("login_rejected_pw_too_long"; username=username)
+        _ip_fail!(ip)
+        return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>Invalid credentials.</p><p><a href='/login'>Try again</a></p>"); headers=["Set-Cookie" => _cookie_set("sid", sid)])
+    end
 
     issued = Float64(get(sess, "login_issued_at_ms", time() * 1000.0))
     form_age_ms = max(0.0, (time() * 1000.0) - issued)
@@ -1145,21 +1437,25 @@ function _login_post(req::HTTP.Request)
     _ip_success!(ip)
 
     if REQUIRE_MFA && !Storage.mfa_totp_enabled(db, username)
+        sid, sess = _session_regenerate!(sid, sess)
         sess["user"] = username
         Storage.save_db(db)
         Audit.log_event("login_requires_mfa_setup"; username=username)
         headers = Pair{String,String}["Set-Cookie" => _cookie_set("sid", sid)]
         body = _mfa_setup_body_html!(sess, username) * "<p class='muted' style='margin-top:12px;'>After enabling MFA, you’ll land on the dashboard.</p>"
-        return _respond(req, 200, _html_page("TOTP Setup", body); headers=headers)
+        return _respond(req, 200, _html_page("TOTP Setup", body; sess=sess); headers=headers)
     end
 
     if Storage.mfa_totp_enabled(db, username)
+        sid, sess = _session_regenerate!(sid, sess)
         sess["pending_user"] = username
         Storage.save_db(db)
         headers = Pair{String,String}["Set-Cookie" => _cookie_set("sid", sid)]
-        return _redirect("/mfa/verify"; headers=headers)
+        tok = _mfa_verify_token(username)
+        return _redirect("/mfa/verify?tok=" * tok; headers=headers)
     end
 
+    sid, sess = _session_regenerate!(sid, sess)
     sess["user"] = username
     Storage.reset_failed_logins!(db, username)
 
@@ -1180,59 +1476,91 @@ end
 
 function _mfa_verify_get(req::HTTP.Request)
     sid, sess, isnew = _session_get(req)
-    csrf = _csrf_token!(sess)
     pending = get(sess, "pending_user", "")
+    tok = get(_parse_query(req.target), "tok", "")
+    if (!(pending isa String) || isempty(pending)) && (tok isa String) && !isempty(tok)
+        parsed = _mfa_verify_token_parse(tok)
+        if parsed !== nothing
+            pending, _ = parsed
+            sess["pending_user"] = pending
+        end
+    end
     if !(pending isa String) || isempty(pending)
         return _redirect("/login"; headers=["Set-Cookie" => _cookie_set("sid", sid)])
     end
+    csrf = _csrf_token!(sess)
     body = """
     <h1>MFA Verification</h1>
     <p class="muted">Enter the 6-digit code from your authenticator app.</p>
     <form method="POST" action="/mfa/verify">
       <input type="hidden" name="csrf" value="$(_html_escape(csrf))">
+      <input type="hidden" name="tok" value="$(_html_escape(String(tok)))">
       <input name="code" inputmode="numeric" required>
       <button type="submit">Verify</button>
     </form>
     """
     headers = Pair{String,String}[]
     push!(headers, "Set-Cookie" => _cookie_set("sid", sid))
-    return _respond(req, 200, _html_page("MFA", body); headers=headers)
+    return _respond(req, 200, _html_page("MFA", body; sess=sess); headers=headers)
 end
 
 function _mfa_verify_post(req::HTTP.Request)
     sid, sess, isnew = _session_get(req)
     db = Storage.load_db(DB_PATH)
-    form = _parse_form(req.body)
-    if !_require_csrf(form, sess)
-        return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>CSRF validation failed.</p>"))
+    form = try
+        _parse_form(req.body)
+    catch e
+        headers = Pair{String,String}[]
+        isnew && push!(headers, "Set-Cookie" => _cookie_set("sid", sid))
+        if e isa FormTooLargeError
+            Storage.save_db(db)
+            Audit.log_event("mfa_verify_form_too_large"; detail=sprint(showerror, e))
+            return _respond(req, 413, _html_page("Too large", "<h1>Request too large</h1><p class='error'>Form too large.</p><p><a href='/mfa/verify'>Back</a></p>"; sess=sess); headers=headers)
+        else
+            Storage.save_db(db)
+            Audit.log_event("mfa_verify_form_invalid"; detail=sprint(showerror, e))
+            return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>Invalid form.</p><p><a href='/mfa/verify'>Back</a></p>"; sess=sess); headers=headers)
+        end
     end
     pending = get(sess, "pending_user", "")
+    token_user = nothing
+    tok = strip(get(form, "tok", ""))
+    if !isempty(tok)
+        parsed = _mfa_verify_token_parse(tok)
+        if parsed !== nothing
+            token_user, _ = parsed
+        end
+    end
+    if pending isa String && !isempty(pending) && token_user !== nothing && pending != token_user
+        Storage.save_db(db)
+        Audit.log_event("mfa_verify_token_mismatch"; username=String(pending))
+        return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>Invalid token.</p>"; sess=sess))
+    end
     if !(pending isa String) || isempty(pending)
-        return _redirect("/login"; headers=["Set-Cookie" => _cookie_set("sid", sid)])
+        if token_user !== nothing
+            pending = token_user
+            sess["pending_user"] = pending
+        else
+            return _redirect("/login"; headers=["Set-Cookie" => _cookie_set("sid", sid)])
+        end
+    end
+    if !_require_csrf(form, sess) && token_user === nothing
+        return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>CSRF validation failed.</p>"; sess=sess))
     end
     secret = Storage.get_totp_secret(db, pending)
     code = strip(get(form, "code", ""))
     if secret === nothing || !Security.totp_verify(secret, code)
         Storage.save_db(db)
         Audit.log_event("login_totp_failed"; username=pending)
-        return _respond(req, 401, _html_page("MFA failed", "<h1>MFA failed</h1><p class='error'>Invalid code.</p><p><a href='/mfa/verify'>Try again</a></p>"))
+        return _respond(req, 401, _html_page("MFA failed", "<h1>MFA failed</h1><p class='error'>Invalid code.</p><p><a href='/mfa/verify'>Try again</a></p>"; sess=sess))
     end
+    sid, sess = _session_regenerate!(sid, sess)
     sess["user"] = pending
-    delete!(sess, "pending_user")
+    _flash_set!(sess, "ok", "MFA verified. You’re signed in.")
     Storage.reset_failed_logins!(db, pending)
     Storage.save_db(db)
     Audit.log_event("login_success"; username=pending, detail="mfa=totp")
-    # Render directly to avoid redirect/cookie edge-cases during local testing.
-    csrf = _csrf_token!(sess)
-    body = """
-    <h1>Welcome, $(_html_escape(pending))</h1>
-    <p class="muted">You’re signed in. (MFA: enabled)</p>
-    <form method="POST" action="/logout">
-      <input type="hidden" name="csrf" value="$(_html_escape(csrf))">
-      <button type="submit">Logout</button>
-    </form>
-    """
-    return _respond(req, 200, _html_page("Account", body); headers=["Set-Cookie" => _cookie_set("sid", sid)])
+    return _redirect("/account"; headers=["Set-Cookie" => _cookie_set("sid", sid)])
 end
 
 function _account_get(req::HTTP.Request)
@@ -1244,8 +1572,10 @@ function _account_get(req::HTTP.Request)
     db = Storage.load_db(DB_PATH)
     mfa = Storage.mfa_totp_enabled(db, u) ? "enabled" : "disabled"
     csrf = _csrf_token!(sess)
+    flash = _flash_take_html!(sess)
     if REQUIRE_MFA && !Storage.mfa_totp_enabled(db, u)
         body = """
+        $(flash)
         <h1>Account</h1>
         <div class="card">
           <div><b>User:</b> $(_html_escape(u))</div>
@@ -1254,9 +1584,10 @@ function _account_get(req::HTTP.Request)
           <p><a href="/mfa/setup">Enable TOTP now</a></p>
         </div>
         """
-        return _respond(req, 200, _html_page("Account", body); headers=["Set-Cookie" => _cookie_set("sid", sid)])
+        return _respond(req, 200, _html_page("Account", body; sess=sess); headers=["Set-Cookie" => _cookie_set("sid", sid)])
     end
     body = """
+    $(flash)
     <h1>Welcome, $(_html_escape(u))</h1>
     <p class="muted">You’re signed in. (MFA: $mfa)</p>
     <form method="POST" action="/logout">
@@ -1264,7 +1595,7 @@ function _account_get(req::HTTP.Request)
       <button type="submit">Logout</button>
     </form>
     """
-    return _respond(req, 200, _html_page("Account", body); headers=["Set-Cookie" => _cookie_set("sid", sid)])
+    return _respond(req, 200, _html_page("Account", body; sess=sess); headers=["Set-Cookie" => _cookie_set("sid", sid)])
 end
 
 function _pw_change_get(req::HTTP.Request)
@@ -1383,7 +1714,7 @@ function _pw_change_get(req::HTTP.Request)
     renderCoach();
     </script>
     """
-    return _respond(req, 200, _html_page("Change password", body); headers=["Set-Cookie" => _cookie_set("sid", sid)])
+    return _respond(req, 200, _html_page("Change password", body; sess=sess); headers=["Set-Cookie" => _cookie_set("sid", sid)])
 end
 
 function _pw_change_post(req::HTTP.Request)
@@ -1393,9 +1724,23 @@ function _pw_change_post(req::HTTP.Request)
         return _redirect("/login"; headers=["Set-Cookie" => _cookie_set("sid", sid)])
     end
     db = Storage.load_db(DB_PATH)
-    form = _parse_form(req.body)
+    form = try
+        _parse_form(req.body)
+    catch e
+        headers = Pair{String,String}[]
+        isnew && push!(headers, "Set-Cookie" => _cookie_set("sid", sid))
+        if e isa FormTooLargeError
+            Storage.save_db(db)
+            Audit.log_event("pw_change_form_too_large"; username=u, detail=sprint(showerror, e))
+            return _respond(req, 413, _html_page("Too large", "<h1>Request too large</h1><p class='error'>Form too large.</p><p><a href='/password/change'>Back</a></p>"; sess=sess); headers=headers)
+        else
+            Storage.save_db(db)
+            Audit.log_event("pw_change_form_invalid"; username=u, detail=sprint(showerror, e))
+            return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>Invalid form.</p><p><a href='/password/change'>Back</a></p>"; sess=sess); headers=headers)
+        end
+    end
     if !_require_csrf(form, sess)
-        return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>CSRF validation failed.</p>"))
+        return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>CSRF validation failed.</p>"; sess=sess))
     end
 
     current = get(form, "current", "")
@@ -1403,15 +1748,23 @@ function _pw_change_post(req::HTTP.Request)
     newpw2 = get(form, "newpw2", "")
     errors = String[]
 
-    st = Storage.verify_login_status(db, u, current, _pepper())
-    if st == :honey
-        Storage.record_failed_login!(db, u; max_failed=1, lockout_minutes=60)
-        Storage.save_db(db)
-        Audit.log_event("breach_honeyword_triggered"; username=u, detail="action=pw_change")
-        return _respond(req, 403, _html_page("Locked", "<h1>Account locked</h1><p class='error'>Security incident detected. Account locked.</p>"); headers=["Set-Cookie" => _cookie_set("sid", sid)])
+    current_too_long = ncodeunits(current) > MAX_PASSWORD_BYTES
+    new_too_long = ncodeunits(newpw) > MAX_PASSWORD_BYTES || ncodeunits(newpw2) > MAX_PASSWORD_BYTES
+    if current_too_long || new_too_long
+        push!(errors, "Password input is too long (max $(MAX_PASSWORD_BYTES) bytes).")
     end
-    if st != :ok
-        push!(errors, "Current password is incorrect.")
+
+    if !current_too_long
+        st = Storage.verify_login_status(db, u, current, _pepper())
+        if st == :honey
+            Storage.record_failed_login!(db, u; max_failed=1, lockout_minutes=60)
+            Storage.save_db(db)
+            Audit.log_event("breach_honeyword_triggered"; username=u, detail="action=pw_change")
+            return _respond(req, 403, _html_page("Locked", "<h1>Account locked</h1><p class='error'>Security incident detected. Account locked.</p>"; sess=sess); headers=["Set-Cookie" => _cookie_set("sid", sid)])
+        end
+        if st != :ok
+            push!(errors, "Current password is incorrect.")
+        end
     end
     if newpw != newpw2
         push!(errors, "New passwords do not match.")
@@ -1438,13 +1791,14 @@ function _pw_change_post(req::HTTP.Request)
         Audit.log_event("password_change_failed"; username=u, detail=join(errors, " | "))
         err_html = "<ul class='error'>" * join(["<li>" * _html_escape(e) * "</li>" for e in errors], "") * "</ul>"
         body = "<h1>Change password</h1>" * err_html * rep_html * "<p><a href='/password/change'>Try again</a></p>"
-        return _respond(req, 400, _html_page("Change password", body); headers=["Set-Cookie" => _cookie_set("sid", sid)])
+        return _respond(req, 400, _html_page("Change password", body; sess=sess); headers=["Set-Cookie" => _cookie_set("sid", sid)])
     end
 
     Storage.update_password!(db, u, newpw, _pepper(); history_size=5, pw_tag=tag)
     Storage.save_db(db)
     Audit.log_event("password_changed"; username=u)
-    return _respond(req, 200, _html_page("Password updated", "<h1>Password updated</h1><p class='ok'>Password changed successfully.</p><p><a href='/account'>Back to account</a></p>"); headers=["Set-Cookie" => _cookie_set("sid", sid)])
+    sid, sess = _session_regenerate!(sid, sess; keep=["user"])
+    return _respond(req, 200, _html_page("Password updated", "<h1>Password updated</h1><p class='ok'>Password changed successfully.</p><p><a href='/account'>Back to account</a></p>"; sess=sess); headers=["Set-Cookie" => _cookie_set("sid", sid)])
 end
 
 function _mfa_setup_get(req::HTTP.Request)
@@ -1453,13 +1807,17 @@ function _mfa_setup_get(req::HTTP.Request)
     if u === nothing
         return _redirect("/login"; headers=["Set-Cookie" => _cookie_set("sid", sid)])
     end
-    return _respond(req, 200, _html_page("TOTP Setup", _mfa_setup_body_html!(sess, u)); headers=["Set-Cookie" => _cookie_set("sid", sid)])
+    return _respond(req, 200, _html_page("TOTP Setup", _mfa_setup_body_html!(sess, u); sess=sess); headers=["Set-Cookie" => _cookie_set("sid", sid)])
 end
 
 function _mfa_setup_body_html!(sess::Dict{String,Any}, u::AbstractString)::String
     csrf = _csrf_token!(sess)
-    secret = Security.totp_secret()
-    sess["totp_setup_secret"] = secret
+    secret = get(sess, "totp_setup_secret", "")
+    if !(secret isa String) || isempty(secret)
+        secret = Security.totp_secret()
+        sess["totp_setup_secret"] = secret
+    end
+    setup_tok = _mfa_setup_token(String(u), secret)
     url = "otpauth://totp/SecureRegWeb:" * String(u) * "?secret=" * secret * "&issuer=SecureRegWeb&digits=6&period=30"
 
     qr_svg = ""
@@ -1479,6 +1837,7 @@ function _mfa_setup_body_html!(sess::Dict{String,Any}, u::AbstractString)::Strin
     </div>
     <form method="POST" action="/mfa/setup">
       <input type="hidden" name="csrf" value="$(_html_escape(csrf))">
+      <input type="hidden" name="setup_token" value="$(_html_escape(setup_tok))">
       <label>Enter current 6-digit code to confirm</label>
       <input name="code" inputmode="numeric" required>
       <button type="submit">Enable</button>
@@ -1489,41 +1848,79 @@ end
 function _mfa_setup_post(req::HTTP.Request)
     sid, sess, isnew = _session_get(req)
     u = _auth_user(sess)
+    db = Storage.load_db(DB_PATH)
+    form = try
+        _parse_form(req.body)
+    catch e
+        uname = u === nothing ? "" : u
+        headers = Pair{String,String}[]
+        isnew && push!(headers, "Set-Cookie" => _cookie_set("sid", sid))
+        if e isa FormTooLargeError
+            Storage.save_db(db)
+            Audit.log_event("mfa_setup_form_too_large"; username=uname, detail=sprint(showerror, e))
+            return _respond(req, 413, _html_page("Too large", "<h1>Request too large</h1><p class='error'>Form too large.</p><p><a href='/mfa/setup'>Back</a></p>"; sess=sess); headers=headers)
+        else
+            Storage.save_db(db)
+            Audit.log_event("mfa_setup_form_invalid"; username=uname, detail=sprint(showerror, e))
+            return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>Invalid form.</p><p><a href='/mfa/setup'>Back</a></p>"; sess=sess); headers=headers)
+        end
+    end
+
+    # If session cookies are missing/blocked, allow a short-lived signed setup token as fallback.
+    token_user = nothing
+    token_secret = nothing
+    tok = strip(get(form, "setup_token", ""))
+    if u === nothing && !isempty(tok)
+        parsed = _mfa_setup_token_parse(tok)
+        if parsed !== nothing
+            token_user, token_secret, _ = parsed
+            u = token_user
+            sess["user"] = u
+            Audit.log_event("mfa_setup_token_used"; username=u)
+        end
+    end
     if u === nothing
+        cookie_present = !isempty(HTTP.header(req, "Cookie", ""))
+        Audit.log_event("mfa_setup_no_session"; detail="cookie_present=$(cookie_present)")
+        Storage.save_db(db)
         return _redirect("/login"; headers=["Set-Cookie" => _cookie_set("sid", sid)])
     end
-    db = Storage.load_db(DB_PATH)
-    form = _parse_form(req.body)
-    if !_require_csrf(form, sess)
-        return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>CSRF validation failed.</p>"))
+
+    if !_require_csrf(form, sess) && token_user === nothing
+        Audit.log_event("mfa_setup_csrf_failed"; username=u)
+        return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>CSRF validation failed.</p>"; sess=sess))
     end
-    secret = get(sess, "totp_setup_secret", "")
+
+    secret = token_secret === nothing ? get(sess, "totp_setup_secret", "") : token_secret
     code = strip(get(form, "code", ""))
     if !(secret isa String) || isempty(secret) || !Security.totp_verify(secret, code)
         Storage.save_db(db)
         Audit.log_event("totp_enable_confirm_failed"; username=u)
-        return _respond(req, 401, _html_page("TOTP", "<h1>TOTP setup failed</h1><p class='error'>Invalid code.</p><p><a href='/mfa/setup'>Try again</a></p>"))
+        return _respond(req, 401, _html_page("TOTP", "<h1>TOTP setup failed</h1><p class='error'>Invalid code.</p><p><a href='/mfa/setup'>Try again</a></p>"; sess=sess))
     end
     Storage.set_totp_secret!(db, u, secret)
     Storage.save_db(db)
     Audit.log_event("totp_enabled"; username=u)
-    delete!(sess, "totp_setup_secret")
-    # Render directly to avoid redirect/cookie edge-cases during local testing.
-    csrf = _csrf_token!(sess)
-    body = """
-    <h1>Welcome, $(_html_escape(u))</h1>
-    <p class="muted">MFA is now enabled.</p>
-    <form method="POST" action="/logout">
-      <input type="hidden" name="csrf" value="$(_html_escape(csrf))">
-      <button type="submit">Logout</button>
-    </form>
-    """
-    return _respond(req, 200, _html_page("Account", body); headers=["Set-Cookie" => _cookie_set("sid", sid)])
+    sid, sess = _session_regenerate!(sid, sess; keep=["user"])
+    _flash_set!(sess, "ok", "MFA is now enabled.")
+    return _redirect("/account"; headers=["Set-Cookie" => _cookie_set("sid", sid)])
 end
 
 function _logout_post(req::HTTP.Request)
     sid, sess, isnew = _session_get(req)
-    form = _parse_form(req.body)
+    form = try
+        _parse_form(req.body)
+    catch e
+        headers = Pair{String,String}[]
+        isnew && push!(headers, "Set-Cookie" => _cookie_set("sid", sid))
+        if e isa FormTooLargeError
+            Audit.log_event("logout_form_too_large"; detail=sprint(showerror, e))
+            return _respond(req, 413, _html_page("Too large", "<h1>Request too large</h1><p class='error'>Form too large.</p><p><a href='/'>Back</a></p>"); headers=headers)
+        else
+            Audit.log_event("logout_form_invalid"; detail=sprint(showerror, e))
+            return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>Invalid form.</p><p><a href='/'>Back</a></p>"); headers=headers)
+        end
+    end
     if !_require_csrf(form, sess)
         return _respond(req, 400, _html_page("Bad Request", "<h1>Bad Request</h1><p class='error'>CSRF validation failed.</p>"))
     end
@@ -1540,7 +1937,7 @@ function _home(req::HTTP.Request)
     if isnew
         push!(headers, "Set-Cookie" => _cookie_set("sid", sid))
     end
-    return _respond(req, 200, _html_page("Home", body); headers=headers)
+    return _respond(req, 200, _html_page("Home", body; sess=sess); headers=headers)
 end
 
 function _lockout_remaining_minutes(user)::Int
@@ -1561,31 +1958,32 @@ function _lockout_remaining_minutes(user)::Int
 end
 
 function _dispatch(req::HTTP.Request)
-    if req.method == "GET" && req.target == "/"
+    target = _target_path(req.target)
+    if req.method == "GET" && target == "/"
         return _home(req)
-    elseif req.method == "GET" && req.target == "/register"
+    elseif req.method == "GET" && target == "/register"
         return _register_get(req)
-    elseif req.method == "POST" && req.target == "/register"
+    elseif req.method == "POST" && target == "/register"
         return _register_post(req)
-    elseif req.method == "GET" && req.target == "/login"
+    elseif req.method == "GET" && target == "/login"
         return _login_get(req)
-    elseif req.method == "POST" && req.target == "/login"
+    elseif req.method == "POST" && target == "/login"
         return _login_post(req)
-    elseif req.method == "GET" && req.target == "/account"
+    elseif req.method == "GET" && target == "/account"
         return _account_get(req)
-    elseif req.method == "GET" && req.target == "/mfa/verify"
+    elseif req.method == "GET" && target == "/mfa/verify"
         return _mfa_verify_get(req)
-    elseif req.method == "POST" && req.target == "/mfa/verify"
+    elseif req.method == "POST" && target == "/mfa/verify"
         return _mfa_verify_post(req)
-    elseif req.method == "GET" && req.target == "/mfa/setup"
+    elseif req.method == "GET" && target == "/mfa/setup"
         return _mfa_setup_get(req)
-    elseif req.method == "POST" && req.target == "/mfa/setup"
+    elseif req.method == "POST" && target == "/mfa/setup"
         return _mfa_setup_post(req)
-    elseif req.method == "GET" && req.target == "/password/change"
+    elseif req.method == "GET" && target == "/password/change"
         return _pw_change_get(req)
-    elseif req.method == "POST" && req.target == "/password/change"
+    elseif req.method == "POST" && target == "/password/change"
         return _pw_change_post(req)
-    elseif req.method == "POST" && req.target == "/logout"
+    elseif req.method == "POST" && target == "/logout"
         return _logout_post(req)
     else
         return HTTP.Response(404, _security_headers(), "Not found")
@@ -1624,7 +2022,7 @@ function start(; host::AbstractString=HOST, port::Integer=PORT)
         resp = _dispatch(req)
         if log_requests
             try
-                println(string(Dates.format(Dates.now(Dates.UTC), dateformat"HH:mm:SS"), " ", req.method, " ", req.target, " -> ", resp.status))
+                println(string(Dates.format(Dates.now(Dates.UTC), dateformat"HH:mm:SS"), " ", req.method, " ", _target_path(req.target), " -> ", resp.status))
             catch
             end
         end

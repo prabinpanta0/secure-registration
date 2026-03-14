@@ -33,7 +33,9 @@ This produces a score (0–100) with feedback for improvement.
 Passwords are not stored in plaintext. The prototype stores:
 
 - a **unique random salt** per password
-- a **slow key-derivation hash**: PBKDF2-HMAC-SHA256 with a high iteration count
+- a **slow password hash**:
+  - preferred: **Argon2id** computed by the system `argon2` CLI (parameters + salt are stored so verification is recomputation + constant-time compare)
+  - fallback: **PBKDF2-HMAC-SHA256** with a high iteration count (stored with salt + iterations)
 - an optional **pepper** from `APP_PEPPER` (a server secret not stored in the database)
 
 This reduces the impact of a database leak by making offline cracking harder.
@@ -81,11 +83,20 @@ The web version includes:
 
 - **Security headers**: CSP, clickjacking protection, no-sniff, referrer policy, cache-control.
 - **CSRF protection** for all POST forms (per-session token).
-- **Signed session cookies** (server-side sessions + HMAC signature).
+- **Server-side sessions** keyed by an opaque `sid` cookie (in-memory session store; cookie uses `HttpOnly` + `SameSite` and adds `Secure` only when configured).
 - **Honeypot field** (hidden input) to catch naive bots.
 - **Basic user-agent filtering** to block common scripted clients.
 - **ML-inspired risk scoring**: a tiny neural-net style classifier over minimal interaction telemetry to trigger step-up/blocks (prototype).
 - **Honeywords (honey-hashing style)**: multiple plausible password hashes are stored; if a honeyword is ever used online, the system treats it as a breach signal and locks the account.
+
+### MFA enrollment/verification tokens (dev UX)
+
+The prototype also uses short-lived **HMAC-signed tokens** during MFA flows to reduce “cookie got lost during redirect” friction in local testing:
+
+- MFA setup token: embedded in the setup form and accepted as a fallback if the session cookie is missing (`APP_MFA_SETUP_TOKEN_TTL_SECONDS`, default 900s).
+- MFA verify token: carried through `/mfa/verify?tok=...` and POSTed back as a hidden field (`APP_MFA_VERIFY_TOKEN_TTL_SECONDS`, default 300s).
+
+Tokens are signed with `APP_SERVER_SECRET` and are intentionally short-lived.
 
 ## What is not realistically implementable in this prototype
 
@@ -106,8 +117,12 @@ If deployed to a server, an example hardening baseline:
 Applied in this prototype:
 
 - **Run unprivileged**: the server is designed to run as a normal user account (not root). Bind to high ports (default `8080`) and put HTTPS in front with a reverse proxy if needed.
-- **Minimal write access**: the app only writes to the local `data/` directory (TOML user DB, SQLite audit log, honeychecker index).
+- **Minimal write access**: the app only writes to the local `data/` directory (SQLite user DB + SQLite audit log).
 - **Restrictive file permissions**:
   - `umask 077` is set at server start so new files default to private.
   - `data/` is created with `0700` permissions; DB files are set to `0600`.
-- **No stored sessions**: sessions are in-memory only (restart clears sessions), reducing long-lived session theft risk.
+- **No persistent sessions**: sessions are in-memory only (restart clears sessions), reducing long-lived session theft risk.
+
+## Logging hygiene (prototype)
+
+If request logging is enabled, the prototype logs the request path without query strings (helps avoid leaking signed MFA tokens via logs during local testing).
